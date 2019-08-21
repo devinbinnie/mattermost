@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -18,8 +19,9 @@ import (
 )
 
 const (
-	THREAD_ANY  = "any"
-	THREAD_ROOT = "root"
+	THREAD_ANY                   = "any"
+	THREAD_ROOT                  = "root"
+	PUSH_NOTIFICATION_RETRY_TIME = 2000 // 2 seconds
 )
 
 func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *model.Channel, sender *model.User, parentPostList *model.PostList) ([]string, error) {
@@ -288,34 +290,37 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 				continue
 			}
 
+			replyToThreadType := ""
+			if value, ok := threadMentionedUserIds[id]; ok {
+				replyToThreadType = value
+			}
+
 			var status *model.Status
 			var err *model.AppError
 			if status, err = a.GetStatus(id); err != nil {
 				status = &model.Status{UserId: id, Status: model.STATUS_OFFLINE, Manual: false, LastActivityAt: 0, ActiveChannel: ""}
 			}
 
-			if ShouldSendPushNotification(profileMap[id], channelMemberNotifyPropsMap[id], true, status, post) {
-				replyToThreadType := ""
-				if value, ok := threadMentionedUserIds[id]; ok {
-					replyToThreadType = value
-				}
+			if ok := a.checkAndSendPushNotification(profileMap[id], channelMemberNotifyPropsMap[id], true, status, post, notification, mentionedUserIds[id], (channelNotification || hereNotification || allNotification), replyToThreadType); !ok {
+				// Retry after a few seconds in case the status has changed in that time so that notifications aren't missed
+				a.Srv.Go(func() {
+					time.Sleep(PUSH_NOTIFICATION_RETRY_TIME)
 
-				a.sendPushNotification(
-					notification,
-					profileMap[id],
-					mentionedUserIds[id],
-					(channelNotification || hereNotification || allNotification),
-					replyToThreadType,
-				)
-			} else {
-				// register that a notification was not sent
-				a.NotificationsLog.Warn("Notification not sent",
-					mlog.String("ackId", ""),
-					mlog.String("type", model.PUSH_TYPE_MESSAGE),
-					mlog.String("userId", id),
-					mlog.String("postId", post.Id),
-					mlog.String("status", model.PUSH_NOT_SENT),
-				)
+					if status, err = a.GetStatus(id); err != nil {
+						status = &model.Status{UserId: id, Status: model.STATUS_OFFLINE, Manual: false, LastActivityAt: 0, ActiveChannel: ""}
+					}
+
+					if ok := a.checkAndSendPushNotification(profileMap[id], channelMemberNotifyPropsMap[id], true, status, post, notification, mentionedUserIds[id], (channelNotification || hereNotification || allNotification), replyToThreadType); !ok {
+						// register that a notification was not sent
+						a.NotificationsLog.Warn("Notification not sent",
+							mlog.String("ackId", ""),
+							mlog.String("type", model.PUSH_TYPE_MESSAGE),
+							mlog.String("userId", id),
+							mlog.String("postId", post.Id),
+							mlog.String("status", model.PUSH_NOT_SENT),
+						)
+					}
+				})
 			}
 		}
 
@@ -331,23 +336,26 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 					status = &model.Status{UserId: id, Status: model.STATUS_OFFLINE, Manual: false, LastActivityAt: 0, ActiveChannel: ""}
 				}
 
-				if ShouldSendPushNotification(profileMap[id], channelMemberNotifyPropsMap[id], false, status, post) {
-					a.sendPushNotification(
-						notification,
-						profileMap[id],
-						false,
-						false,
-						"",
-					)
-				} else {
-					// register that a notification was not sent
-					a.NotificationsLog.Warn("Notification not sent",
-						mlog.String("ackId", ""),
-						mlog.String("type", model.PUSH_TYPE_MESSAGE),
-						mlog.String("userId", id),
-						mlog.String("postId", post.Id),
-						mlog.String("status", model.PUSH_NOT_SENT),
-					)
+				if ok := a.checkAndSendPushNotification(profileMap[id], channelMemberNotifyPropsMap[id], false, status, post, notification, false, false, ""); !ok {
+					// Retry after a few seconds in case the status has changed in that time so that notifications aren't missed
+					a.Srv.Go(func() {
+						time.Sleep(PUSH_NOTIFICATION_RETRY_TIME)
+
+						if status, err = a.GetStatus(id); err != nil {
+							status = &model.Status{UserId: id, Status: model.STATUS_OFFLINE, Manual: false, LastActivityAt: 0, ActiveChannel: ""}
+						}
+
+						if ok := a.checkAndSendPushNotification(profileMap[id], channelMemberNotifyPropsMap[id], false, status, post, notification, false, false, ""); !ok {
+							// register that a notification was not sent
+							a.NotificationsLog.Warn("Notification not sent",
+								mlog.String("ackId", ""),
+								mlog.String("type", model.PUSH_TYPE_MESSAGE),
+								mlog.String("userId", id),
+								mlog.String("postId", post.Id),
+								mlog.String("status", model.PUSH_NOT_SENT),
+							)
+						}
+					})
 				}
 			}
 		}
@@ -388,6 +396,22 @@ func (a *App) SendNotifications(post *model.Post, team *model.Team, channel *mod
 
 	a.Publish(message)
 	return mentionedUsersList, nil
+}
+
+func (a *App) checkAndSendPushNotification(user *model.User, channelNotifyProps model.StringMap, wasMentioned bool, status *model.Status, post *model.Post, notification *postNotification, explicitMention, channelWideMention bool, replyToThreadType string) bool {
+	if ShouldSendPushNotification(user, channelNotifyProps, wasMentioned, status, post) {
+		a.sendPushNotification(
+			notification,
+			user,
+			explicitMention,
+			channelWideMention,
+			replyToThreadType,
+		)
+
+		return true
+	}
+
+	return false
 }
 
 // sendOutOfChannelMentions sends an ephemeral post to the sender of a post if any of the given potential mentions

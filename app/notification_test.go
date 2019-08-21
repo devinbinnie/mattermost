@@ -68,6 +68,8 @@ func TestSendNotifications(t *testing.T) {
 	mentions, err = th.App.SendNotifications(post1, th.BasicTeam, th.BasicChannel, th.BasicUser, nil)
 	require.NoError(t, err)
 	require.Len(t, mentions, 0)
+
+	th.App.Srv.WaitForGoroutines()
 }
 
 func TestSendNotificationsWithManyUsers(t *testing.T) {
